@@ -11,11 +11,20 @@ from PyQt5.QtWidgets import (
     QSystemTrayIcon, QFileDialog, QMessageBox, QGraphicsOpacityEffect,
 )
 from PyQt5.QtCore import Qt, QPropertyAnimation, QPoint, QTimer, QRect, QEasingCurve
-from PyQt5.QtGui import QPixmap, QIcon, QFont
+from PyQt5.QtGui import QPixmap, QIcon, QFont, QTransform
 
 DEFAULT_PET_HEIGHT = 200
 SIZE_OPTIONS = {"小": 140, "中": 200, "大": 260}
 VERSION = "0.2.0"
+
+# schedule rules: (day_of_week, hour, minute, bubble_text) — day_of_week=None means every day
+# 0=Mon 1=Tue 2=Wed 3=Thu 4=Fri 5=Sat 6=Sun
+SCHEDULE_RULES = [
+    (None, 12, 0, "该吃午饭了"),
+    (1, 19, 0, "佳人们，开播了"),
+    (2, 22, 0, "gjjc要结算啦！"),
+    (6, 22, 0, "jjc要结算啦！"),
+]
 
 # PyInstaller support
 if getattr(sys, "frozen", False):
@@ -33,7 +42,7 @@ FOOD_REACTIONS = {
     "过期罐头": {
         "speech": "我chovy，你tm拿食物给我拿好了鸭，我吃柠檬",
         "mood": "Mood_angry",
-        "mood_duration": 3000,
+        "mood_duration": 6000,
         "good": False,
         "delta": -1,
     },
@@ -56,6 +65,24 @@ FOOD_REACTIONS = {
         "speech": "好吃喵~谢谢喵~谢谢投喂喵~",
         "good": True,
         "delta": 3,
+    },
+    "礼包": {
+        "speech": "分析礼包中……",
+        "good": True,
+        "delta": 3,
+        "no_repeat_warning": True,
+        "is_gift": True,
+    },
+    "沙拉": {
+        "speech": "好吃喵~谢谢喵~谢谢投喂喵~",
+        "good": True,
+        "delta": 1,
+    },
+    "KFC炸鸡": {
+        "speech": "好吃喵~谢谢喵~谢谢投喂喵~",
+        "good": True,
+        "delta": 2,
+        "no_repeat_warning": True,
     },
 }
 
@@ -297,6 +324,24 @@ class DesktopPet(QMainWindow):
         # --- favorability ---
         self._favorability = 0
 
+        # --- gift pack tracking ---
+        self._gift_count = 0
+
+        # --- marry scene ---
+        self._marrying = False
+
+        # --- award scene ---
+        self._award_anim_timer = QTimer(self)
+        self._award_anim_timer.timeout.connect(self._do_award_step)
+        self._award_anim_index = 0
+        self._award_base_pixmap = None
+        self._award_angles = []
+        self._award_end_timer = QTimer(self)
+        self._award_end_timer.setSingleShot(True)
+        self._award_end_timer.timeout.connect(self._end_award_scene)
+        self._pre_award_sprite_idx = None
+        self._pre_award_pos = None
+
         # --- celebration ---
         self._celebrating = False
         self._oh_left_label = QLabel(None)
@@ -320,6 +365,38 @@ class DesktopPet(QMainWindow):
             path = os.path.join(base, "Audio", "special", special_name)
             if os.path.exists(path):
                 self._special_audio = path
+                break
+
+        # default voice for triple-click
+        self._default_voice = None
+        for base in (_BASE_DIR, _EXE_DIR):
+            path = os.path.join(base, "Audio", "那么问题来了，大家觉得.mp3")
+            if os.path.exists(path):
+                self._default_voice = path
+                break
+
+        # chovy audio for expired can
+        self._chovy_audio = None
+        for base in (_BASE_DIR, _EXE_DIR):
+            path = os.path.join(base, "Audio", "special", "chovy.mp3")
+            if os.path.exists(path):
+                self._chovy_audio = path
+                break
+
+        # award scene audio
+        self._busy_audio = None
+        for base in (_BASE_DIR, _EXE_DIR):
+            path = os.path.join(base, "Audio", "special", "很忙.mp3")
+            if os.path.exists(path):
+                self._busy_audio = path
+                break
+
+        # marry scene audio
+        self._lover_audio = None
+        for base in (_BASE_DIR, _EXE_DIR):
+            path = os.path.join(base, "Audio", "special", "Lover.flac")
+            if os.path.exists(path):
+                self._lover_audio = path
                 break
 
         self._celebrate_timer = QTimer(self)
@@ -348,7 +425,7 @@ class DesktopPet(QMainWindow):
 
         # --- audio ---
         pygame.mixer.init()
-        self._volume = 0.3
+        self._volume = 0.5
         self._play_mode = "random"
         self._seq_index = 0
         self._click_count = 0
@@ -376,6 +453,18 @@ class DesktopPet(QMainWindow):
         self._tray.activated.connect(self._on_tray_activated)
         self._build_tray_menu()
         self._tray.show()
+
+        # --- app icon for message boxes ---
+        self._app_icon = QIcon()
+        ico_path = os.path.join(_BASE_DIR, "downPic", "duck.ico")
+        if os.path.exists(ico_path):
+            self._app_icon = QIcon(ico_path)
+
+        # --- scheduled bubbles ---
+        self._schedule_timer = QTimer(self)
+        self._schedule_timer.timeout.connect(self._check_schedule)
+        self._schedule_timer.start(30000)  # check every 30 seconds
+        self._scheduled_fired = set()  # tracks "YYYY-MM-DD HH:MM" slots already fired
 
         self.show()
         self._start_idle()
@@ -541,6 +630,14 @@ class DesktopPet(QMainWindow):
 
         menu.addSeparator()
 
+        fav_view = menu.addAction("查看好感度")
+        fav_view.triggered.connect(self._show_favorability)
+
+        fav_clear = menu.addAction("好感度清零")
+        fav_clear.triggered.connect(self._clear_favorability)
+
+        menu.addSeparator()
+
         auto_act = menu.addAction("开机自启" if not self._has_startup() else "取消自启")
         auto_act.triggered.connect(self._toggle_autostart)
 
@@ -598,7 +695,9 @@ class DesktopPet(QMainWindow):
             self._click_count += 1
             if self._click_count >= 3:
                 self._reset_clicks()
-                if self._audio_files:
+                if self._default_voice:
+                    self._play_audio(self._default_voice)
+                elif self._audio_files:
                     self._play_next()
             else:
                 self._click_timer.start(500)
@@ -668,7 +767,7 @@ class DesktopPet(QMainWindow):
     # ── feeding ──────────────────────────────────────────────────────
 
     def _feed_pet(self, food_name: str, food_pix: QPixmap):
-        if self._feeding or self._celebrating:
+        if self._feeding or self._celebrating or self._marrying:
             return
         self._feeding = True
 
@@ -695,6 +794,16 @@ class DesktopPet(QMainWindow):
             self._feeding = False
             return
 
+        # play chovy audio for expired can
+        if food_name == "过期罐头" and self._chovy_audio:
+            try:
+                pygame.mixer.music.stop()
+                pygame.mixer.music.set_volume(self._volume)
+                pygame.mixer.music.load(self._chovy_audio)
+                pygame.mixer.music.play()
+            except pygame.error:
+                pass
+
         # repeated food detection
         if food_name == self._last_food:
             self._last_food_count += 1
@@ -702,12 +811,43 @@ class DesktopPet(QMainWindow):
             self._last_food = food_name
             self._last_food_count = 1
 
+        # gift pack tracking
+        is_gift = reaction.get("is_gift", False)
+        if is_gift:
+            self._gift_count += 1
+        else:
+            self._gift_count = 0
+
         heart = "♥" if self._favorability >= 0 else "♡"
-        if self._last_food_count >= 3 and reaction.get("good", True):
+        if is_gift:
+            speech = reaction.get("speech", "分析礼包中……")
+        elif self._last_food_count >= 3 and reaction.get("good", True) and not reaction.get("no_repeat_warning"):
             speech = "能不能换一个食物喵~吃腻了喵~"
         else:
             speech = reaction.get("speech", "好吃！")
         self._say(f"{speech}  [{heart} {self._favorability}]")
+
+        # HIGHEST PRIORITY: celebration when favorability hits max
+        if prev_fav < 10 and self._favorability >= 10:
+            self._gift_count = 0
+            self._last_food_count = 0
+            QTimer.singleShot(400, self._celebrate_max)
+            self._feeding = False
+            return
+
+        # check for award scene trigger on 3rd consecutive gift
+        if is_gift and self._gift_count >= 3:
+            self._gift_count = 0
+            QTimer.singleShot(400, self._start_award_scene)
+            self._feeding = False
+            return
+
+        # check for marry scene trigger on 3rd consecutive KFC炸鸡
+        if food_name == "KFC炸鸡" and self._last_food_count >= 3:
+            self._last_food_count = 0
+            QTimer.singleShot(400, self._start_marry_scene)
+            self._feeding = False
+            return
 
         mood_name = reaction.get("mood")
         if mood_name and mood_name in self._mood_pixmaps:
@@ -716,8 +856,6 @@ class DesktopPet(QMainWindow):
         # threshold events — fire on crossing
         if prev_fav < 5 and self._favorability >= 5:
             QTimer.singleShot(800, lambda: self._show_mood("Mood_happy", 5000))
-        if prev_fav < 10 and self._favorability >= 10:
-            QTimer.singleShot(800, self._celebrate_max)
 
         if self._poof_pixmap:
             pet_cx = self.pos().x() + self.width() // 2
@@ -776,6 +914,155 @@ class DesktopPet(QMainWindow):
         self._celebrating = False
         self._favorability = 0
 
+    # ── award scene ───────────────────────────────────────────────────
+
+    def _start_award_scene(self):
+        if self._celebrating:
+            return
+        self._celebrating = True
+        self._mood_timer.stop()
+        self._clear_mood()
+        self._anim.stop()
+
+        # load base award pixmap
+        if "Mood_award" in self._mood_pixmaps:
+            self._award_base_pixmap = self._mood_pixmaps["Mood_award"]
+        else:
+            self._celebrating = False
+            return
+
+        # save pre-award state
+        self._pre_award_sprite_idx = self._sprite_idx
+        self._pre_award_pos = self.pos()
+
+        # set the award image
+        self.label.setPixmap(self._award_base_pixmap)
+        self.label.resize(self._award_base_pixmap.size())
+        self.resize(self.label.size())
+
+        # play award music
+        if self._busy_audio and os.path.exists(self._busy_audio):
+            try:
+                pygame.mixer.music.stop()
+                pygame.mixer.music.set_volume(self._volume)
+                pygame.mixer.music.load(self._busy_audio)
+                pygame.mixer.music.play()
+            except pygame.error:
+                pass
+
+        # build angle sequence: [5,0,5,0, -5,0,-5,0] repeated for ~8s at 100ms per step
+        group = [5, 0, 5, 0, -5, 0, -5, 0]
+        self._award_angles = group * 10  # 80 steps = 8 seconds
+        self._award_anim_index = 0
+
+        self._award_anim_timer.start(100)
+        self._award_end_timer.start(8000)
+
+    def _do_award_step(self):
+        if self._award_anim_index >= len(self._award_angles):
+            self._award_anim_timer.stop()
+            return
+        angle = self._award_angles[self._award_anim_index]
+        self._award_anim_index += 1
+
+        if self._award_base_pixmap is None:
+            return
+
+        t = QTransform().rotate(angle)
+        rotated = self._award_base_pixmap.transformed(t, Qt.SmoothTransformation)
+        self.label.setPixmap(rotated)
+        # keep the label centered so the window doesn't visibly shift
+        self.label.resize(rotated.size())
+        self.resize(rotated.size())
+        # re-center the window around the original pet center
+        cx = self._pre_award_pos.x() + self._award_base_pixmap.width() // 2
+        cy = self._pre_award_pos.y() + self._award_base_pixmap.height() // 2
+        nx = cx - rotated.width() // 2
+        ny = cy - rotated.height() // 2
+        self.move(nx, ny)
+
+    def _end_award_scene(self):
+        self._award_anim_timer.stop()
+        self._award_anim_index = 0
+        self._award_angles = []
+        self._award_base_pixmap = None
+
+        # restore original sprite
+        if self._pre_award_sprite_idx is not None:
+            idx = self._pre_award_sprite_idx
+            self._pre_award_sprite_idx = None
+            self._show_sprite(idx)
+            self.resize(self.label.size())
+
+        # restore position
+        if self._pre_award_pos is not None:
+            self.move(self._pre_award_pos)
+            self._pre_award_pos = None
+
+        self._celebrating = False
+
+    # ── marry scene ───────────────────────────────────────────────────
+
+    def _start_marry_scene(self):
+        if self._celebrating or self._marrying:
+            return
+        self._marrying = True
+        self._mood_timer.stop()
+        self._clear_mood()
+        self._anim.stop()
+
+        if "Mood_marry" not in self._mood_pixmaps:
+            self._marrying = False
+            return
+
+        self._say("很对很对很对")
+
+        # play music
+        if self._lover_audio and os.path.exists(self._lover_audio):
+            try:
+                pygame.mixer.music.stop()
+                pygame.mixer.music.set_volume(self._volume)
+                pygame.mixer.music.load(self._lover_audio)
+                pygame.mixer.music.play()
+            except pygame.error:
+                pass
+
+        # walk animation: left 2 steps, right 2 steps, back to start
+        self._rest_pos = self.pos()
+        screen = QApplication.primaryScreen().availableGeometry()
+        margin = self.width() + 10
+        step = 45
+        start_x = self._rest_pos.x()
+        if start_x - step * 2 < margin:
+            step = max(0, (start_x - margin) // 2)
+
+        self._anim.setDuration(1800)
+        self._anim.setKeyValues([
+            (0.0, QPoint(start_x, self._rest_pos.y())),
+            (0.15, QPoint(start_x - step, self._rest_pos.y())),
+            (0.3, QPoint(start_x - step * 2, self._rest_pos.y())),
+            (0.5, QPoint(start_x - step, self._rest_pos.y())),
+            (0.65, QPoint(start_x, self._rest_pos.y())),
+            (1.0, QPoint(start_x, self._rest_pos.y())),
+        ])
+
+        self._anim.finished.disconnect(self._on_anim_done)
+        self._anim.finished.connect(self._on_marry_walk_done)
+        self._anim.start()
+
+    def _on_marry_walk_done(self):
+        self._anim.finished.disconnect(self._on_marry_walk_done)
+        self._anim.finished.connect(self._on_anim_done)
+        self._rest_pos = None
+
+        self._show_mood("Mood_marry", 13000)
+        QTimer.singleShot(13000, self._end_marry_scene)
+
+    def _end_marry_scene(self):
+        self._marrying = False
+        self._clear_mood()
+        self._start_idle()
+
     # ── mood ─────────────────────────────────────────────────────────
 
     def _show_mood(self, mood_name: str, duration_ms: int):
@@ -800,6 +1087,8 @@ class DesktopPet(QMainWindow):
         box.setWindowTitle("好感度归零")
         box.setText("你对牢鸭太坏了，牢鸭很生气！")
         box.setIcon(QMessageBox.Warning)
+        if not self._app_icon.isNull():
+            box.setWindowIcon(self._app_icon)
         box.setStandardButtons(QMessageBox.NoButton)
         sorry_btn = box.addButton("对不起", QMessageBox.AcceptRole)
         wrong_btn = box.addButton("我错了", QMessageBox.AcceptRole)
@@ -812,14 +1101,65 @@ class DesktopPet(QMainWindow):
     # ── about ────────────────────────────────────────────────────────
 
     def _show_about(self):
-        QMessageBox.about(
-            self, "关于 桌宠牢鸭",
+        box = QMessageBox(self)
+        box.setWindowTitle("关于 桌宠牢鸭")
+        box.setText(
             f"<h3>Desktop Duck v{VERSION}</h3>"
             "<p>牢鸭桌宠，爱他就给他一个家</p>"
             "<p>作者：石楠花</p>"
             "<p>把 Audio 和 Pic 文件夹放在 exe 同级目录即可自定义素材。</p>"
             "<p>本次更新归石楠花所有。对于催更行为，将予以“已读并在意但不一定改进”的处理。</p>"
         )
+        if not self._app_icon.isNull():
+            box.setWindowIcon(self._app_icon)
+        box.exec_()
+
+    # ── favorability ──────────────────────────────────────────────────
+
+    def _show_favorability(self):
+        levels = {10: "满", 9: "极高", 7: "高", 5: "中", 3: "低", 0: "初始"}
+        if self._favorability < 0:
+            desc = "坏心情"
+        else:
+            desc = "初始"
+            for threshold, label in sorted(levels.items(), reverse=True):
+                if self._favorability >= threshold:
+                    desc = label
+                    break
+        box = QMessageBox(self)
+        box.setWindowTitle("好感度")
+        box.setText(f"当前好感度: {self._favorability} / 10\n状态: {desc}")
+        box.setIcon(QMessageBox.Information)
+        box.setStandardButtons(QMessageBox.Ok)
+        if not self._app_icon.isNull():
+            box.setWindowIcon(self._app_icon)
+        box.exec_()
+
+    def _clear_favorability(self):
+        self._favorability = 0
+        self._gift_count = 0
+        self._last_food = None
+        self._last_food_count = 0
+        self._say("好感度已清零~")
+
+    # ── scheduled bubbles ─────────────────────────────────────────────
+
+    def _check_schedule(self):
+        from datetime import datetime
+        now = datetime.now()
+        slot = now.strftime("%Y-%m-%d %H:%M")
+        if slot in self._scheduled_fired:
+            return
+        for day_of_week, hour, minute, text in SCHEDULE_RULES:
+            if day_of_week is not None and now.weekday() != day_of_week:
+                continue
+            if now.hour == hour and now.minute == minute:
+                self._say(text)
+                self._scheduled_fired.add(slot)
+                # purge old entries (keep only today's)
+                today = now.strftime("%Y-%m-%d")
+                self._scheduled_fired = {s for s in self._scheduled_fired if s.startswith(today)}
+                break
 
     # ── animations ───────────────────────────────────────────────────
 
